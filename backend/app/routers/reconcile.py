@@ -2,12 +2,16 @@ from __future__ import annotations
 from fastapi import APIRouter
 from app.db import db, rows_to_list
 from app.services.gate import gate_consistency
+from app.services import admit_evidence as evidence
 from app.services import admit_pipe_surface_ledger
 
 router = APIRouter(tags=["对账"])
 
 
 @router.get("/对账")
+@router.get("/reconcile", include_in_schema=False)
+@router.get("/reconciliation", include_in_schema=False)
+@router.get("/对账报告", include_in_schema=False)
 def reconcile():
     with db() as conn:
         release_stats = {
@@ -65,6 +69,9 @@ def reconcile():
         )
         promote_count = conn.execute("SELECT COUNT(*) AS c FROM promote_events").fetchone()["c"]
         consistency = gate_consistency(conn)
+        gaps = evidence.sync_gap_pins(conn)
+        water = evidence.water_state(conn)
+        difference = consistency["对账差额"]
         dirty_links = rows_to_list(
             conn.execute(
                 """
@@ -78,12 +85,43 @@ def reconcile():
                 """
             ).fetchall()
         )
+        for link in dirty_links:
+            link_id = link.get("挂接编号")
+            release_id = link.get("发版单编号")
+            link.update({
+                "id": link_id,
+                "link_id": link_id,
+                "挂接id": link_id,
+                "release_id": release_id,
+                "releaseId": release_id,
+                "serial": link.get("发版单号"),
+                "release_serial": link.get("发版单号"),
+                "link_state": link.get("挂接状态"),
+                "linkState": link.get("挂接状态"),
+                "state": link.get("挂接状态"),
+                "verdict": link.get("挂接结论"),
+                "link_verdict": link.get("挂接结论"),
+                "alarm": bool(link.get("告警")),
+                "alarmed": bool(link.get("告警")),
+                "created_at": link.get("时间"),
+            })
         return {
             "发版统计": release_stats,
             "晋升事件数": promote_count,
             "名册与实例": version_vs_instance,
             "入闸一致性": consistency,
             "挂接行": dirty_links,
+            "对账差额": difference,
+            "difference": difference,
+            "缺口": gaps,
+            "gaps": gaps,
+            "流水线入闸水位": water,
+            "水位": water,
+            "重放": {
+                "缺口总数": len(gaps),
+                "可重放": not gaps,
+                "事件册": evidence.list_admit_events(conn, limit=100),
+            },
         }
 
 def _surface_reconcile_pipe25() -> dict:

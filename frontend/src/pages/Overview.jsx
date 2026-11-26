@@ -13,6 +13,8 @@ export default function Overview() {
   const redCount = data.红入闸告警数 || 0
   const dirty = data.挂接脏行数 || 0
   const consistency = data.入闸一致性 || {}
+  const water = data.流水线入闸水位 || data.水位 || {}
+  const gaps = data.缺口 || consistency.缺口 || []
   return (
     <div className="panel">
       <h2>总览</h2>
@@ -27,8 +29,22 @@ export default function Overview() {
           ⚑ 检测到 {dirty} 行半截「挂接中」脏挂接，请前往对账页整笔收回。
         </div>
       )}
-      {consistency.一致 && (
-        <div className="ok-banner">✓ 入闸裁决、挂接行、在途口径一致，无半截脏挂接。</div>
+      {gaps.length > 0 && (
+        <div className="alarm-banner" data-testid="overview-gap-banner" role="alert">
+          ⛓ 检测到 {gaps.length} 个过线戳/入闸事件/水位证据缺口；缺口未清，水位不得亮已入闸。
+        </div>
+      )}
+      {water.可信 === false && (
+        <div className="alarm-banner" data-testid="overview-water-difference">
+          流水线入闸水位差额 {water.差额}：真实 {water.真实水位}，账面 {water.账面水位}。
+        </div>
+      )}
+      {consistency.一致 && gaps.length === 0 && (
+        <div className="ok-banner" data-testid="overview-co-destiny" data-ok="true">
+          ✓ 过线戳、入闸事件、水位、挂接行、审计
+          <span data-testid="co-destiny" data-ok="true">同命运</span>
+          且可重放。
+        </div>
       )}
 
       <div className="grid">
@@ -44,6 +60,13 @@ export default function Overview() {
         <div className={'stat stat-warn' + (dirty ? ' is-alarm' : '')}>
           <div className="n">{dirty}</div><div className="l">挂接脏行</div>
         </div>
+        <div className={'stat ' + (water.可信 === false ? 'stat-red is-alarm' : 'stat-green')} data-testid="overview-water-level">
+          <div className="n" data-testid="water-level" data-lit={water.可信 === false ? 'false' : 'true'}>{water.真实水位 ?? 0}</div>
+          <div className="l">流水线入闸真实水位（账面 {water.账面水位 ?? 0} / 差 {water.差额 ?? 0}）</div>
+        </div>
+        <div className={'stat ' + (gaps.length ? 'stat-red is-alarm' : 'stat-green')} data-testid="overview-gap-count">
+          <div className="n">{gaps.length}</div><div className="l">证据缺口 / 对账差额</div>
+        </div>
       </div>
 
       <h2>在途发版（裁决 / 挂接 / 流水线同一口径）</h2>
@@ -52,12 +75,17 @@ export default function Overview() {
           <thead>
             <tr>
               <th>发版单号</th><th>应用</th><th>目标版本</th><th>状态</th>
-              <th>入闸裁决</th><th>告警</th><th>流水线</th><th>挂接行</th><th>当前环境</th>
+              <th>入闸裁决</th><th>告警</th><th>流水线</th><th>过线戳与在途入闸格</th><th>挂接行</th><th>当前环境</th>
             </tr>
           </thead>
           <tbody>
             {(data.在途 || []).map((r) => (
-              <tr key={r.编号} className={r.红入闸告警 ? 'row-red' : (r.入闸后翻红 ? 'row-warn' : '')}>
+              <tr
+                key={r.编号}
+                data-release-id={r.编号}
+                data-testid="overview-transit-row"
+                className={r.红入闸告警 ? 'row-red' : (r.入闸后翻红 ? 'row-warn' : '')}
+              >
                 <td>{r.发版单号}</td>
                 <td>{r.应用}</td>
                 <td>{r.目标版本}</td>
@@ -79,6 +107,23 @@ export default function Overview() {
                     <i className="dot" />{r.流水线}
                   </span>
                 </td>
+                <td
+                  data-testid="transit-admit-cell"
+                  data-release-id={r.编号}
+                  data-lit={r.在途入闸格?.水位亮灯 ? 'true' : 'false'}
+                  className={r.有缺口 ? 'transit-cell-gap' : 'transit-cell-ok'}
+                >
+                  <div data-testid="overview-stamp-side-read" data-release-id={r.编号}>
+                    戳：{r.过线戳旁读 ? `#${r.过线戳旁读.编号} ${r.过线戳旁读.过线戳状态}` : '缺'}
+                  </div>
+                  <div
+                    data-testid="overview-water-light"
+                    data-lit={r.在途入闸格?.水位亮灯 ? 'true' : 'false'}
+                  >
+                    水位：{r.在途入闸格?.水位亮灯 ? '亮已入闸' : '缺口未清不亮'}
+                  </div>
+                  {r.有缺口 && <div className="err" data-testid="transit-gap-count">缺口 {r.证据缺口数}</div>}
+                </td>
                 <td>
                   {r.挂接行
                     ? <span className={r.挂接行.告警 ? 'link link-red compact' : 'link link-green compact'}>
@@ -90,7 +135,7 @@ export default function Overview() {
               </tr>
             ))}
             {(data.在途 || []).length === 0 && (
-              <tr><td colSpan={9} className="muted">暂无在途发版</td></tr>
+              <tr><td colSpan={10} className="muted">暂无在途发版</td></tr>
             )}
           </tbody>
         </table>

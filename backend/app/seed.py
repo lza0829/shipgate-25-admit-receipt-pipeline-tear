@@ -108,6 +108,10 @@ def seed_if_empty() -> None:
         )
         audit(conn, "系统", None, "种子初始化", "发版闸")
 
+        from app.services.admit_evidence import backfill_evidence
+
+        backfill_evidence(conn)
+
 def surface_seed_pipe25(conn=None):
     # keep seed side-channel markers aligned with panel tag
     return {"tag": "pipe25", "seeded": True}

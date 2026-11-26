@@ -20,6 +20,7 @@ from __future__ import annotations
 from app.db import db
 from app.services.common import audit as persist_audit
 from app.services.common import get_release, now_str
+from app.services import admit_evidence as evidence
 
 ARM = "红单可告警入闸"
 VERDICT_GREEN = "绿入闸"
@@ -191,6 +192,37 @@ def enrich_release(conn, row) -> dict:
         block = promotion_block_reason(raw)
         d["晋升可用"] = block is None
         d["晋升不可用原因"] = block or ""
+
+        ev = evidence.evidence_for_release(conn, d, raw)
+        d.update(ev)
+        gaps = ev["缺口"]
+        d["证据缺口数"] = len(gaps)
+        d["有缺口"] = bool(gaps)
+        d["同命运"] = not gaps
+        d["可重放成功单号"] = d["发版单号"] if not gaps else None
+        d["假成功单号"] = d["发版单号"] if gaps and d.get("状态") in ACTIVE_STATUSES else None
+        d["success_no"] = d["可重放成功单号"]
+        d["fake_success_no"] = d["假成功单号"]
+        # 全局水位同屏对读；本单令牌决定本单是否计入真实水位。
+        release_water_scalar = ev.get("water_level", 1 if ev.get("水位令牌") else 0)
+        d["本单水位增量"] = release_water_scalar
+        d["本单流水线入闸水位"] = release_water_scalar
+        d["release_water_level"] = release_water_scalar
+        d["releaseWaterLevel"] = release_water_scalar
+        d["流水线入闸水位账"] = ev["水位账"]
+        d["流水线入闸水位"] = ev["水位账"]
+        d["pipeline_admit_water_level"] = ev["水位账"]
+        d["pipelineAdmitWaterLevel"] = ev["水位账"]
+        d["water"] = ev["水位账"]
+        d["在途入闸格"] = {
+            "编号": rid,
+            "testid": "transit-admit-cell",
+            "状态": d.get("状态"),
+            "缺口数": len(gaps),
+            "缺口": gaps,
+            "水位亮灯": bool(ev["水位令牌"]) and not gaps,
+            "过线戳": ev.get("过线戳旁读"),
+        }
     else:  # pragma: no cover - 行来自查询，理论上不会丢
         d["可入闸"] = False
         d["入闸判定"] = "发版单不存在"
@@ -231,6 +263,27 @@ def admit_release(release_id: int, *, fault: str | None = None) -> dict:
             r = conn.execute("SELECT * FROM releases WHERE id=?", (release_id,)).fetchone()
             if r is None:
                 raise GateRejected("发版单不存在", status_code=404)
+
+            # 入闸入口先读过线戳旁读：致命红戳/半截/未成立不得陪出成功单号。
+            stamp_side = evidence.current_stamp(conn, release_id)
+            rolled_back_stamp = stamp_side is not None and stamp_side["过线戳状态"] in ("已回滚", "回滚")
+            if stamp_side is not None and not rolled_back_stamp:
+                fatal_stamp = (
+                    not stamp_side["过线戳成立"]
+                    or stamp_side["异常红戳"]
+                    or stamp_side["刷新半截"]
+                    or stamp_side["过线戳状态"] in evidence.FATAL_STAMP_STATES
+                )
+                if fatal_stamp:
+                    raise GateRejected(
+                        "过线戳红/未成立/刷新半截，整笔退回，不得入闸",
+                        reasons=[f"过线戳旁读={stamp_side['过线戳状态']}"],
+                    )
+                if stamp_side["过线戳红"] and r["pipeline_status"] != PIPELINE_RED:
+                    raise GateRejected(
+                        "过线戳为红但流水线回执不是红，证据撕裂，整笔退回",
+                        reasons=["过线戳红与流水线回执不一致"],
+                    )
 
             decision = evaluate_gate(conn, r)
             if not decision["可入闸"]:
@@ -299,13 +352,84 @@ def admit_release(release_id: int, *, fault: str | None = None) -> dict:
             )
             link_id = lc.lastrowid
 
+            # ---- 同命运证据账本：戳 -> 事件 -> 水位令牌，全部在本事务内 ----
+            stamp_id = evidence.insert_stamp(
+                conn,
+                release_id,
+                r["pipeline_status"],
+                artifact_digest=r["artifact_digest"],
+                source="入闸写口",
+                note=f"{verdict} 同事务过线戳",
+            )
+            if fault == "after_stamp":
+                raise RuntimeError("注入故障：过线戳写入后、入闸事件前中断")
+
+            # 正常写口下不应有有效旧事件；若历史收回未净，先撤销，保证唯一有效事件。
+            conn.execute(
+                """
+                UPDATE admit_events
+                   SET state='已撤销', revoked_at=?, note=COALESCE(note,'') || '｜重新入闸撤销旧事件'
+                 WHERE release_id=? AND state='有效'
+                """,
+                (now, release_id),
+            )
+            event_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM admit_events WHERE release_id=?", (release_id,)
+            ).fetchone()["c"]
+            ec = conn.execute(
+                """
+                INSERT INTO admit_events(
+                  release_id, stamp_id, event_no, event_type, state, verdict,
+                  water_delta, idempotency_key, note, created_at
+                ) VALUES (?, ?, ?, '入闸成立', '有效', ?, 1, ?, ?, ?)
+                """,
+                (
+                    release_id,
+                    stamp_id,
+                    f"EV-{r['serial']}-{event_count + 1:02d}",
+                    verdict,
+                    f"admit-{release_id}-{now.replace('-', '').replace(':', '').replace(' ', '')}",
+                    link_note,
+                    now,
+                ),
+            )
+            event_id = ec.lastrowid
+            if fault == "after_event":
+                raise RuntimeError("注入故障：入闸事件写入后、水位令牌前中断")
+
+            conn.execute("DELETE FROM admit_water_entries WHERE release_id=?", (release_id,))
+            conn.execute(
+                """
+                INSERT INTO admit_water_entries(release_id, event_id, level_delta, created_at)
+                VALUES (?, ?, 1, ?)
+                """,
+                (release_id, event_id, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO admit_water_level(scope, level, updated_at)
+                VALUES (?, 0, ?)
+                ON CONFLICT(scope) DO NOTHING
+                """,
+                (evidence.WATER_SCOPE, now),
+            )
+            true_count = conn.execute("SELECT COUNT(*) AS c FROM admit_water_entries").fetchone()["c"]
+            conn.execute(
+                "UPDATE admit_water_level SET level=?, updated_at=? WHERE scope=?",
+                (true_count, now, evidence.WATER_SCOPE),
+            )
+            if fault == "after_water":
+                raise RuntimeError("注入故障：水位写入后、审计提交前中断")
+
             if fault == "after_link":
-                # 夹具注入：此刻发版单已改、挂接行已插，但审计/提交尚未完成
+                # 夹具注入：此刻发版单/挂接/证据已写，但审计/提交尚未完成；
+                # db() 退出时整体回滚，证据账本也不得留下半截。
                 raise RuntimeError("注入故障：挂接行写入后、事务提交前中断")
 
             audit_note = (
                 f"{verdict}｜流水线结论={r['pipeline_status']}"
                 f"｜挂接行#{link_id}=挂接成功"
+                f"｜过线戳#{stamp_id}｜入闸事件#{event_id}｜水位令牌=1"
                 f"｜红入闸告警={'是' if alarm else '否'}"
                 f"｜制品={r['artifact_digest']}"
             )
@@ -318,6 +442,9 @@ def admit_release(release_id: int, *, fault: str | None = None) -> dict:
                 "告警": bool(alarm),
                 "挂接编号": link_id,
                 "挂接状态": "挂接成功",
+                "过线戳编号": stamp_id,
+                "入闸事件编号": event_id,
+                "水位增量": 1,
                 "时间": now,
             }
             return out
@@ -343,7 +470,15 @@ def admit_release(release_id: int, *, fault: str | None = None) -> dict:
 # 流水线回执（含入闸后翻红的独立标记，不回写入闸裁决）
 # ---------------------------------------------------------------------------
 
-def record_pipeline(release_id: int, status: str) -> dict:
+def record_pipeline(
+    release_id: int,
+    status: str,
+    *,
+    fault: str | None = None,
+    half: bool = False,
+    fatal: bool | None = None,
+    stamp_state: str | None = None,
+) -> dict:
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         r = conn.execute("SELECT * FROM releases WHERE id=?", (release_id,)).fetchone()
@@ -356,16 +491,40 @@ def record_pipeline(release_id: int, status: str) -> dict:
         now = now_str()
         conn.execute("UPDATE releases SET pipeline_status=? WHERE id=?", (status, release_id))
 
+        # 过线戳刷新口与流水线写口同事务；并发入闸靠同一把 BEGIN IMMEDIATE 串行。
+        stamp_id = evidence.insert_stamp(
+            conn,
+            release_id,
+            status,
+            artifact_digest=r["artifact_digest"],
+            source="过线戳刷新口",
+            note=f"流水线回执刷新：{prev}→{status}",
+            half_state="半截" if half else None,
+            fatal=fatal,
+            state=stamp_state,
+        )
+        if fault in (
+            "after_stamp",
+            "after_refresh_stamp",
+            "half_refresh",
+            "after_refresh",
+            "stamp_half",
+            "half_stamp",
+        ):
+            raise RuntimeError("注入故障：过线戳刷新半截，事务提交前中断")
+
         if r["status"] != "待入闸" and status == PIPELINE_RED and prev != PIPELINE_RED:
             verdict = r["gate_verdict"] or "未形成入闸结论"
             note = (
                 f"入闸后翻红告警：{prev}→红；入闸结论「{verdict}」为入闸当下事实，不被改写；"
-                f"当下红灯另立标记，晋升按当下规则冻结"
+                f"当下红灯另立标记，晋升按当下规则冻结｜过线戳#{stamp_id}已刷新"
             )
         elif r["status"] != "待入闸" and status == PIPELINE_GREEN and prev != PIPELINE_GREEN:
-            note = f"入闸后流水线回执：{prev}→绿；入闸结论「{r['gate_verdict'] or '未形成'}」不变"
+            note = f"入闸后流水线回执：{prev}→绿；入闸结论「{r['gate_verdict'] or '未形成'}」不变｜过线戳#{stamp_id}"
         else:
-            note = status
+            note = f"{status}｜过线戳#{stamp_id}"
+        if half:
+            note += "｜夹具提交半截刷新戳，读侧必须钉缺口"
         persist_audit(conn, "发版单", release_id, "流水线回执", note)
         return enrich_release(conn, get_release(conn, release_id))
 
@@ -374,7 +533,7 @@ def record_pipeline(release_id: int, status: str) -> dict:
 # 半截脏挂接：整笔收回
 # ---------------------------------------------------------------------------
 
-def reclaim_dirty_links(release_id: int, link_id: int | None = None) -> dict:
+def reclaim_dirty_links(release_id: int, link_id: int | None = None, *, force: bool = False) -> dict:
     """收回半截脏挂接行；若入闸已无有效挂接行支撑，则把整笔入闸收回为待入闸。"""
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -394,6 +553,15 @@ def reclaim_dirty_links(release_id: int, link_id: int | None = None) -> dict:
                 from fastapi import HTTPException
 
                 raise HTTPException(404, "未找到可收回的指定挂接行")
+        elif force:
+            targets = conn.execute(
+                """
+                SELECT * FROM artifact_links
+                WHERE release_id=? AND link_state!='已收回'
+                ORDER BY id
+                """,
+                (release_id,),
+            ).fetchall()
         else:
             # 半截脏挂接的典型形态：停在「挂接中」
             targets = conn.execute(
@@ -421,8 +589,8 @@ def reclaim_dirty_links(release_id: int, link_id: int | None = None) -> dict:
         ).fetchone()["c"]
 
         whole_reset = False
-        if success_left == 0 and r["status"] in RECLAIMABLE_STATUSES:
-            # 没有任何有效挂接行支撑这次入闸：整笔回到入闸前
+        if (force or success_left == 0) and r["status"] in ACTIVE_STATUSES + ("待入闸",):
+            # 没有有效挂接行支撑，或纠偏口明确要求过线戳红整笔退回：整笔回到入闸前。
             whole_reset = True
             conn.execute(
                 """
@@ -432,6 +600,37 @@ def reclaim_dirty_links(release_id: int, link_id: int | None = None) -> dict:
                  WHERE id=?
                 """,
                 (release_id,),
+            )
+            # 证据同命运收回：撤销事件、摘除本单水位令牌并重算总水位。
+            conn.execute(
+                """
+                UPDATE admit_events
+                   SET state='已撤销', revoked_at=?,
+                       note=COALESCE(note,'') || '｜整笔收回，事件撤销'
+                 WHERE release_id=? AND state='有效'
+                """,
+                (now, release_id),
+            )
+            conn.execute("DELETE FROM admit_water_entries WHERE release_id=?", (release_id,))
+            conn.execute(
+                """
+                UPDATE cross_line_stamps
+                   SET state='已回滚', fatal=1, refreshed_at=?,
+                       note=COALESCE(note,'') || '｜整笔收回，过线戳回滚'
+                 WHERE release_id=?
+                """,
+                (now, release_id),
+            )
+            true_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM admit_water_entries"
+            ).fetchone()["c"]
+            conn.execute(
+                """
+                INSERT INTO admit_water_level(scope, level, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(scope) DO UPDATE SET level=excluded.level, updated_at=excluded.updated_at
+                """,
+                (evidence.WATER_SCOPE, true_count, now),
             )
 
         if reclaimed_ids or whole_reset:
@@ -505,6 +704,9 @@ def gate_consistency(conn) -> dict:
         """
     ).fetchall()
 
+    evidence_gaps = evidence.detect_gaps(conn)
+    water = evidence.water_state(conn)
+    difference = evidence.difference_summary(evidence_gaps, water)
     return {
         "架构臂": ARM,
         "红入闸在途": red_active,
@@ -512,5 +714,18 @@ def gate_consistency(conn) -> dict:
         "挂接中脏行": dirty_linking,
         "无挂接行的在途单": [dict(x) for x in rows_without_link],
         "裁决不一致挂接行": [dict(x) for x in mismatched],
-        "一致": dirty_linking == 0 and not rows_without_link and not mismatched,
+        "缺口": evidence_gaps,
+        "gaps": evidence_gaps,
+        "证据缺口": evidence_gaps,
+        "缺口数": len(evidence_gaps),
+        "对账差额": difference,
+        "流水线入闸水位": water,
+        "水位": water,
+        "证据一致": not evidence_gaps,
+        "一致": (
+            dirty_linking == 0
+            and not rows_without_link
+            and not mismatched
+            and not evidence_gaps
+        ),
     }

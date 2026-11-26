@@ -18,15 +18,19 @@ export default function Audit() {
     return '/审计' + (qs ? `?${qs}` : '')
   }
   const load = () => api(buildQuery()).then(setRows).catch((e) => setErr(e.message))
+  const submit = (event) => {
+    event.preventDefault()
+    load().catch((e) => setErr(e.message))
+  }
   useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="panel">
       <h2>审计流水</h2>
       {err && <p className="err">{err}</p>}
-      <div className="row">
+      <form className="row" onSubmit={submit}>
         <label>类别
-          <select value={kind} onChange={(e) => setKind(e.target.value)}>
+          <select value={kind} data-testid="audit-filter-kind" onChange={(e) => setKind(e.target.value)}>
             <option value="">全部</option>
             <option value="发版单">发版单</option>
             <option value="晋升">晋升</option>
@@ -36,11 +40,11 @@ export default function Audit() {
             <option value="系统">系统</option>
           </select>
         </label>
-        <label>关联编号<input value={refId} onChange={(e) => setRefId(e.target.value)} placeholder="发版单编号" /></label>
-        <label>关键字<input value={kw} onChange={(e) => setKw(e.target.value)} placeholder="红入闸 / 驳回 / 收回" /></label>
-        <button type="button" onClick={() => load().catch((e) => setErr(e.message))}>查询</button>
-        <button type="button" className="secondary" onClick={() => { setKind(''); setRefId(''); setKw(''); setTimeout(() => api('/审计').then(setRows), 0) }}>清空</button>
-      </div>
+        <label>关联编号<input value={refId} data-testid="audit-filter-ref" onChange={(e) => setRefId(e.target.value)} placeholder="发版单编号" /></label>
+        <label>关键字<input value={kw} data-testid="audit-filter-keyword" onChange={(e) => setKw(e.target.value)} placeholder="红入闸 / 驳回 / 收回" /></label>
+        <button type="submit" data-testid="audit-filter-submit">查询</button>
+        <button type="button" className="secondary" data-testid="audit-filter-clear" onClick={() => { setKind(''); setRefId(''); setKw(''); setTimeout(() => api('/审计').then(setRows), 0) }}>清空</button>
+      </form>
       <div className="table-wrap">
         <table data-testid="audit-table">
           <thead><tr><th>时间</th><th>类别</th><th>动作</th><th>关联</th><th>备注</th></tr></thead>

@@ -115,6 +115,72 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS cross_line_stamps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  release_id INTEGER NOT NULL,
+  stamp_no TEXT NOT NULL DEFAULT '',
+  revision INTEGER NOT NULL DEFAULT 1,
+  color TEXT NOT NULL DEFAULT '未过',
+  state TEXT NOT NULL DEFAULT '未成立',
+  established INTEGER NOT NULL DEFAULT 0,
+  passed INTEGER NOT NULL DEFAULT 0,
+  green INTEGER NOT NULL DEFAULT 0,
+  red INTEGER NOT NULL DEFAULT 0,
+  fatal INTEGER NOT NULL DEFAULT 0,
+  half_state TEXT NOT NULL DEFAULT '完成',
+  pipeline_status TEXT NOT NULL DEFAULT '未回执',
+  artifact_digest TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'pipeline',
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  refreshed_at TEXT,
+  FOREIGN KEY(release_id) REFERENCES releases(id)
+);
+CREATE INDEX IF NOT EXISTS idx_cross_stamps_release ON cross_line_stamps(release_id, id);
+CREATE TABLE IF NOT EXISTS admit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  release_id INTEGER NOT NULL,
+  stamp_id INTEGER,
+  event_no TEXT NOT NULL DEFAULT '',
+  event_type TEXT NOT NULL DEFAULT '入闸成立',
+  state TEXT NOT NULL DEFAULT '有效',
+  verdict TEXT,
+  water_delta INTEGER NOT NULL DEFAULT 1,
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  revoked_at TEXT,
+  FOREIGN KEY(release_id) REFERENCES releases(id),
+  FOREIGN KEY(stamp_id) REFERENCES cross_line_stamps(id)
+);
+CREATE INDEX IF NOT EXISTS idx_admit_events_release ON admit_events(release_id, id);
+CREATE TABLE IF NOT EXISTS admit_water_entries (
+  release_id INTEGER PRIMARY KEY,
+  event_id INTEGER,
+  level_delta INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(release_id) REFERENCES releases(id),
+  FOREIGN KEY(event_id) REFERENCES admit_events(id)
+);
+CREATE TABLE IF NOT EXISTS admit_water_level (
+  scope TEXT PRIMARY KEY,
+  level INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS admit_gap_pins (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  release_id INTEGER,
+  gap_type TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT '高',
+  expected TEXT NOT NULL DEFAULT '',
+  actual TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  pinned INTEGER NOT NULL DEFAULT 1,
+  cleared INTEGER NOT NULL DEFAULT 0,
+  detected_at TEXT NOT NULL,
+  cleared_at TEXT,
+  UNIQUE(release_id, gap_type)
+);
 """
 
 RELEASE_STATUSES = ("待入闸", "已入闸", "晋升中", "已放行", "回滚中", "已回滚", "已关闭")
@@ -167,6 +233,10 @@ def init_db() -> None:
     with db() as conn:
         conn.executescript(SCHEMA)
         migrate(conn)
+        # 旧库/种子在表建好后平滑补录证据账本；只补缺失事实，不遮盖拧花状态。
+        from app.services.admit_evidence import backfill_evidence
+
+        backfill_evidence(conn)
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:

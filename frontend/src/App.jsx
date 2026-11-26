@@ -3,6 +3,7 @@ import { NavLink, Route, Routes } from 'react-router-dom'
 import Overview from './pages/Overview'
 import Apps from './pages/Apps'
 import Releases from './pages/Releases'
+import Events from './pages/Events'
 import Promote from './pages/Promote'
 import Windows from './pages/Windows'
 import Rollback from './pages/Rollback'
@@ -15,6 +16,7 @@ const links = [
   ['/', '总览'],
   ['/应用', '应用'],
   ['/发版单', '发版单'],
+  ['/事件册', '事件册'],
   ['/晋升', '晋升'],
   ['/窗口', '窗口'],
   ['/回滚', '回滚'],
@@ -45,6 +47,8 @@ export default function App() {
           <Route path="/" element={<Overview />} />
           <Route path="/应用" element={<Apps />} />
           <Route path="/发版单" element={<Releases />} />
+          <Route path="/事件册" element={<Events />} />
+          <Route path="/events" element={<Events />} />
           <Route path="/晋升" element={<Promote />} />
           <Route path="/窗口" element={<Windows />} />
           <Route path="/回滚" element={<Rollback />} />
